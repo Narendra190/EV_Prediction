@@ -9,7 +9,40 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="EV Forecast", layout="wide")
 
 # === Load model ===
-model = joblib.load('forecasting_ev_model.pkl')
+model = None
+model_load_error = None
+try:
+    model = joblib.load('forecasting_ev_model.pkl')
+except FileNotFoundError:
+    model_load_error = "Model file 'forecasting_ev_model.pkl' not found. Forecasting is disabled."
+    st.error(model_load_error)
+except ModuleNotFoundError as e:
+    model_load_error = f"Missing dependency when loading model: {e}. Please ensure 'scikit-learn' is listed in requirements.txt and redeploy."
+    st.error(model_load_error)
+except Exception as e:
+    model_load_error = f"Error loading model: {e}"
+    st.error(model_load_error)
+
+# Helper to predict with model or fallback heuristic
+def safe_predict(df_row, features):
+    """Return a prediction using the loaded model if available, otherwise use a simple heuristic."""
+    if model is not None:
+        return model.predict(df_row)[0]
+    # Heuristic fallback: use rolling mean and recent pct changes
+    lag1 = features.get('ev_total_lag1', 0)
+    roll_mean = features.get('ev_total_roll_mean_3', lag1)
+    pct1 = features.get('ev_total_pct_change_1', 0)
+    pct3 = features.get('ev_total_pct_change_3', 0)
+    try:
+        avg_pct = np.mean([pct1, pct3])
+        if np.isnan(avg_pct):
+            avg_pct = 0
+    except Exception:
+        avg_pct = 0
+    pred = roll_mean * (1 + avg_pct)
+    if pred <= 0:
+        pred = roll_mean
+    return float(pred)
 
 # === Styling ===
 st.markdown("""
@@ -53,7 +86,7 @@ st.markdown("""
 # Stylized title using markdown + HTML
 st.markdown("""
     <div style='text-align: center; font-size: 36px; font-weight: bold; color: #FFFFFF; margin-top: 20px;'>
-        🔮 EV Adoption Forecaster for a County in Washington State
+        🔮 EV Adoption Forecaster for a Country in Washington State
     </div>
 """, unsafe_allow_html=True)
 
@@ -84,22 +117,38 @@ def load_data():
 
 df = load_data()
 
-# === County dropdown ===
-county_list = sorted(df['County'].dropna().unique().tolist())
-county = st.selectbox("Select a County", county_list)
+# Notify user if model failed to load and heuristic will be used
+if model is None:
+    st.warning("Trained model is unavailable. The app will use a simple heuristic to generate forecasts. To use the trained model, ensure 'scikit-learn' is installed and 'forecasting_ev_model.pkl' is present, then redeploy.")
 
-if county not in df['County'].unique():
-    st.warning(f"County '{county}' not found in dataset.")
+# Backwards/forwards compatibility: ensure both `Country`/`County` and their encoded columns exist
+# This lets the rest of the script use either naming convention without further changes.
+if 'Country' not in df.columns and 'County' in df.columns:
+    df['Country'] = df['County']
+if 'County' not in df.columns and 'Country' in df.columns:
+    df['County'] = df['Country']
+
+if 'country_encoded' not in df.columns and 'county_encoded' in df.columns:
+    df['country_encoded'] = df['county_encoded']
+if 'county_encoded' not in df.columns and 'country_encoded' in df.columns:
+    df['county_encoded'] = df['country_encoded']
+
+# === Country dropdown ===
+country_list = sorted(df['Country'].dropna().unique().tolist())
+country = st.selectbox("Select a Country", country_list)
+
+if country not in df['Country'].unique():
+    st.warning(f"Country '{country}' not found in dataset.")
     st.stop()
 
-county_df = df[df['County'] == county].sort_values("Date")
-county_code = county_df['county_encoded'].iloc[0]
+country_df = df[df['Country'] == country].sort_values("Date")
+country_code = country_df['country_encoded'].iloc[0]
 
 # === Forecasting ===
-historical_ev = list(county_df['Electric Vehicle (EV) Total'].values[-6:])
+historical_ev = list(country_df['Electric Vehicle (EV) Total'].values[-6:])
 cumulative_ev = list(np.cumsum(historical_ev))
-months_since_start = county_df['months_since_start'].max()
-latest_date = county_df['Date'].max()
+months_since_start = country_df['months_since_start'].max()
+latest_date = country_df['Date'].max()
 
 future_rows = []
 forecast_horizon = 36
@@ -116,7 +165,7 @@ for i in range(1, forecast_horizon + 1):
 
     new_row = {
         'months_since_start': months_since_start,
-        'county_encoded': county_code,
+        'county_encoded': country_code,
         'ev_total_lag1': lag1,
         'ev_total_lag2': lag2,
         'ev_total_lag3': lag3,
@@ -126,7 +175,7 @@ for i in range(1, forecast_horizon + 1):
         'ev_growth_slope': ev_growth_slope
     }
 
-    pred = model.predict(pd.DataFrame([new_row]))[0]
+    pred = safe_predict(pd.DataFrame([new_row]), new_row)
     future_rows.append({"Date": forecast_date, "Predicted EV Total": round(pred)})
 
     historical_ev.append(pred)
@@ -138,7 +187,7 @@ for i in range(1, forecast_horizon + 1):
         cumulative_ev.pop(0)
 
 # === Combine Historical + Forecast for Cumulative Plot ===
-historical_cum = county_df[['Date', 'Electric Vehicle (EV) Total']].copy()
+historical_cum = country_df[['Date', 'Electric Vehicle (EV) Total']].copy()
 historical_cum['Source'] = 'Historical'
 historical_cum['Cumulative EV'] = historical_cum['Electric Vehicle (EV) Total'].cumsum()
 
@@ -152,11 +201,11 @@ combined = pd.concat([
 ], ignore_index=True)
 
 # === Plot Cumulative Graph ===
-st.subheader(f"📊 Cumulative EV Forecast for {county} County")
+st.subheader(f"📊 Cumulative EV Forecast for {country} Country")
 fig, ax = plt.subplots(figsize=(12, 6))
 for label, data in combined.groupby('Source'):
     ax.plot(data['Date'], data['Cumulative EV'], label=label, marker='o')
-ax.set_title(f"Cumulative EV Trend - {county} (3 Years Forecast)", fontsize=14, color='white')
+ax.set_title(f"Cumulative EV Trend - {country} (3 Years Forecast)", fontsize=14, color='white')
 ax.set_xlabel("Date", color='white')
 ax.set_ylabel("Cumulative EV Count", color='white')
 ax.grid(True, alpha=0.3)
@@ -173,23 +222,23 @@ forecasted_total = forecast_df['Cumulative EV'].iloc[-1]
 if historical_total > 0:
     forecast_growth_pct = ((forecasted_total - historical_total) / historical_total) * 100
     trend = "increase 📈" if forecast_growth_pct > 0 else "decrease 📉"
-    st.success(f"Based on the graph, EV adoption in **{county}** is expected to show a **{trend} of {forecast_growth_pct:.2f}%** over the next 3 years.")
+    st.success(f"Based on the graph, EV adoption in **{country}** is expected to show a **{trend} of {forecast_growth_pct:.2f}%** over the next 3 years.")
 else:
     st.warning("Historical EV total is zero, so percentage forecast change can't be computed.")
 
 
-# === New: Compare up to 3 counties ===
+# === New: Compare up to 3 countries ===
 st.markdown("---")
-st.header("Compare EV Adoption Trends for up to 3 Counties")
+st.header("Compare EV Adoption Trends for up to 3 Countries")
 
-multi_counties = st.multiselect("Select up to 3 counties to compare", county_list, max_selections=3)
+multi_counties = st.multiselect("Select up to 3 countries to compare", country_list, max_selections=3)
 
 if multi_counties:
     comparison_data = []
 
     for cty in multi_counties:
-        cty_df = df[df['County'] == cty].sort_values("Date")
-        cty_code = cty_df['county_encoded'].iloc[0]
+        cty_df = df[df['Country'] == cty].sort_values("Date")
+        cty_code = cty_df['country_encoded'].iloc[0]
 
         hist_ev = list(cty_df['Electric Vehicle (EV) Total'].values[-6:])
         cum_ev = list(np.cumsum(hist_ev))
@@ -218,7 +267,7 @@ if multi_counties:
                 'ev_total_pct_change_3': pct_change_3,
                 'ev_growth_slope': ev_slope
             }
-            pred = model.predict(pd.DataFrame([new_row]))[0]
+            pred = safe_predict(pd.DataFrame([new_row]), new_row)
             future_rows_cty.append({"Date": forecast_date, "Predicted EV Total": round(pred)})
 
             hist_ev.append(pred)
@@ -258,7 +307,7 @@ if multi_counties:
     ax.set_facecolor("#1c1c1c")
     fig.patch.set_facecolor('#1c1c1c')
     ax.tick_params(colors='white')
-    ax.legend(title="County")
+    ax.legend(title="Country")
     st.pyplot(fig)
     
     # Display % growth for selected counties ===
@@ -279,5 +328,3 @@ if multi_counties:
     st.success(f"Forecasted EV adoption growth over next 3 years — {growth_sentence}")
 
 st.success("Forecast complete")
-
-st.markdown("Prepared for the **AICTE Internship Cycle 2 by S4F**")
